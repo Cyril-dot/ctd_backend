@@ -50,6 +50,26 @@ const listPeers = async (req, res) => {
     }
 };
 
+// hasActiveEntitlement reports whether a user currently holds a trial or
+// subscription that is active, inside its time window, and not used up.
+const hasActiveEntitlement = async (userId) => {
+    if (!userId) return false;
+    const result = await pool.query(
+        `SELECT 1 FROM trials
+          WHERE user_id = $1 AND status = 'active'
+            AND starts_at <= NOW() AND expires_at > NOW()
+            AND used_bytes < quota_bytes
+         UNION ALL
+         SELECT 1 FROM subscriptions
+          WHERE user_id = $1 AND status = 'active'
+            AND starts_at <= NOW() AND expires_at > NOW()
+            AND used_bytes < quota_bytes
+         LIMIT 1`,
+        [userId]
+    );
+    return result.rows.length > 0;
+};
+
 // POST /gateways/:id/peers — authorize a device as a WireGuard peer.
 // Body: { device_id }
 // Creates the peer row (status 'pending'), queues AUTHORIZE_PEER; the peer
@@ -74,11 +94,25 @@ const authorizePeer = async (req, res) => {
         }
 
         const dev = await pool.query(
-            `SELECT id, public_key FROM devices WHERE id = $1`,
+            `SELECT id, user_id, public_key FROM devices WHERE id = $1`,
             [device_id]
         );
         if (dev.rows.length === 0) {
             return res.status(404).json({ message: "Device not found" });
+        }
+
+        // Entitlement gate: a device may only be peered while its owner holds
+        // a live trial or subscription. Without this, an operator could hand
+        // free internet to any registered device. "Live" uses the same rules
+        // usage ingestion relies on (status 'active', quota not used up) plus
+        // the time window, so a lapsed trial or package is refused too.
+        if (!(await hasActiveEntitlement(dev.rows[0].user_id))) {
+            return res.status(403).json({
+                code: "no_active_entitlement",
+                message:
+                    "The device owner has no active trial or package (expired, used up, or never claimed). " +
+                    "Claim a trial or activate a package first."
+            });
         }
 
         const dup = await pool.query(
