@@ -60,11 +60,8 @@ const registerGateway = async (req, res) => {
             return res.status(400).json({ message: "name is required" });
         }
         const capacity =
-            capacity_users === undefined ? null : Number(capacity_users);
-        if (
-            capacity !== null &&
-            (!Number.isInteger(capacity) || capacity < 0)
-        ) {
+            capacity_users === undefined ? 0 : Number(capacity_users);
+        if (!Number.isInteger(capacity) || capacity < 0) {
             return res.status(400).json({
                 message: "capacity_users must be a non-negative integer"
             });

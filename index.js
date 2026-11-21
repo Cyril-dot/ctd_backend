@@ -68,7 +68,13 @@ app.use("/usage", UsageRouter);
 app.use("/admin", AdminRouter);
 const result = await confirmation(pool);
 
-app.listen(PORT, ()=>{
-console.log(`server working at port: ${PORT}`);
-console.log(result)
-});
+export default app;
+
+// On Vercel the Express app is served as a serverless function (see
+// api/index.js), so it must not call listen() there.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`server working at port: ${PORT}`);
+    console.log(result);
+  });
+}
