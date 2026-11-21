@@ -25,7 +25,7 @@ plane* — customer Internet traffic never passes through here.
      psql -h <host> -U <user> -d <db> -f "$m"
    done
    ```
-   Migrations and what they do (`001`–`008`, all safe to re-run):
+   Migrations and what they do (`001`–`009`, all safe to re-run):
    - `001` — base schema snapshot: the 13 business tables, indexes and
      foreign keys. (The Better Auth tables and `gateway_commands` are
      created by `002` and `004` respectively.)
@@ -43,6 +43,9 @@ plane* — customer Internet traffic never passes through here.
    - `008` — adds the OAuth token columns better-auth 1.7.x expects on
      `account` (`accessToken`, `refreshToken`, `idToken`,
      `accessTokenExpiresAt`, `refreshTokenExpiresAt`, `scope`).
+   - `009` — adds `gateways.wg_public_key`, `wg_endpoint` and `wg_dns` (what a
+     customer app needs to build its WireGuard config) and a unique index on
+     `gateway_peers(gateway_id, tunnel_ip)` so tunnel IP allocation is race-safe.
 
 3. Copy the example env file and fill it in:
    ```bash
