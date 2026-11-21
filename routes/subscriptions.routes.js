@@ -6,8 +6,10 @@ import {
     suspendSubscription,
     renewSubscription,
 } from "../controllers/subscriptions.js";
+import { uuidParam } from "../utils/uuid.js";
 
 const SubscriptionsRouter = express.Router();
+SubscriptionsRouter.param("id", uuidParam("Subscription"));
 
 SubscriptionsRouter.get("/", listSubscriptions);
 SubscriptionsRouter.get("/active", getActiveSubscription);

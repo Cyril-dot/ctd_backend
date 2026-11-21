@@ -13,8 +13,10 @@ import {
     listAuditLogs,
     getStats,
 } from "../controllers/admin.js";
+import { uuidParam } from "../utils/uuid.js";
 
 const AdminRouter = express.Router();
+AdminRouter.param("id", uuidParam("Resource"));
 
 // Everything under /admin requires the admin role
 AdminRouter.use(requireAdmin);

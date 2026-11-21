@@ -20,8 +20,11 @@ import {
 } from "../controllers/gateways.js";
 import { reportSession } from "../controllers/sessions.js";
 import { reportUsage } from "../controllers/usage.js";
+import { uuidParam } from "../utils/uuid.js";
 
 const GatewaysRouter = express.Router();
+GatewaysRouter.param("id", uuidParam("Gateway"));
+GatewaysRouter.param("peerId", uuidParam("Peer"));
 
 // Bootstrap: provision-token auth (see controller), NOT a user session
 GatewaysRouter.post(
