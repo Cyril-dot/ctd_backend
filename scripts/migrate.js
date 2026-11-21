@@ -33,6 +33,11 @@ async function main() {
         database: process.env.DB_NAME,
         user: process.env.DB_USER,
         password: process.env.DB_PASSWORD,
+        // Neon (and other hosted Postgres) requires SSL; local/docker
+        // Postgres does not. Set DB_SSL=true on hosted deploys only.
+        ...(process.env.DB_SSL === "true"
+            ? { ssl: { rejectUnauthorized: false } }
+            : {}),
     });
 
     try {
