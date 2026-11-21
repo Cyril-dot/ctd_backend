@@ -1,6 +1,12 @@
 import crypto from "node:crypto";
 import { pool } from "../config/db.js";
 import { deliverPendingCommands } from "./gatewayCommands.js";
+import { expireLapsedEntitlements } from "./entitlementExpiry.js";
+
+// Best-effort throttle for the expiry sweep. On serverless this is per
+// instance only; correctness never depends on it (the sweep is idempotent).
+const EXPIRY_SWEEP_INTERVAL_MS = 30_000;
+let lastExpirySweep = 0;
 
 // Seconds after the last heartbeat before a gateway reads as offline.
 const HEARTBEAT_TIMEOUT_SECONDS = Number(
@@ -104,6 +110,16 @@ const registerGateway = async (req, res) => {
 // needs no inbound management port (PDF section 11).
 const heartbeat = async (req, res) => {
     try {
+        // Enforce time-based expiry; a failure here must not fail the ping.
+        if (Date.now() - lastExpirySweep >= EXPIRY_SWEEP_INTERVAL_MS) {
+            lastExpirySweep = Date.now();
+            try {
+                await expireLapsedEntitlements();
+            } catch (sweepError) {
+                console.error("expireLapsedEntitlements error:", sweepError);
+            }
+        }
+
         await pool.query(
             `UPDATE gateways
              SET last_heartbeat_at = NOW(), status = 'online'

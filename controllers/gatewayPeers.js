@@ -210,4 +210,4 @@ const revokePeer = async (req, res) => {
     }
 };
 
-export { listPeers, authorizePeer, revokePeer };
+export { listPeers, authorizePeer, revokePeer, hasActiveEntitlement };
