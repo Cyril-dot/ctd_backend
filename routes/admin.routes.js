@@ -7,6 +7,7 @@ import {
     updateUserRole,
     listGatewaysAdmin,
     deleteGateway,
+    updateGatewayConnection,
     updatePackage,
     deletePackage,
     listPayments,
@@ -29,6 +30,7 @@ AdminRouter.patch("/users/:id", updateUserStatus);
 AdminRouter.patch("/users/:id/role", updateUserRole);
 
 AdminRouter.get("/gateways", listGatewaysAdmin);
+AdminRouter.patch("/gateways/:id", updateGatewayConnection);
 AdminRouter.delete("/gateways/:id", deleteGateway);
 
 AdminRouter.patch("/packages/:id", updatePackage);

@@ -70,6 +70,124 @@ const hasActiveEntitlement = async (userId) => {
     return result.rows.length > 0;
 };
 
+// authorizeDevice — shared core of the admin route and the customer connect
+// endpoint. Returns { status, body } (an HTTP code and JSON body) and never
+// touches req/res. Throws only on unexpected errors.
+const MAX_IP_ATTEMPTS = 5;
+
+const authorizeDevice = async (gatewayId, deviceId) => {
+    const gw = await pool.query(
+        `SELECT id FROM gateways WHERE id = $1`,
+        [gatewayId]
+    );
+    if (gw.rows.length === 0) {
+        return { status: 404, body: { message: "Gateway not found" } };
+    }
+
+    const dev = await pool.query(
+        `SELECT id, user_id, public_key FROM devices WHERE id = $1`,
+        [deviceId]
+    );
+    if (dev.rows.length === 0) {
+        return { status: 404, body: { message: "Device not found" } };
+    }
+
+    // Entitlement gate: a device may only be peered while its owner holds
+    // a live trial or subscription. Without this, an operator could hand
+    // free internet to any registered device. "Live" uses the same rules
+    // usage ingestion relies on (status 'active', quota not used up) plus
+    // the time window, so a lapsed trial or package is refused too.
+    if (!(await hasActiveEntitlement(dev.rows[0].user_id))) {
+        return {
+            status: 403,
+            body: {
+                code: "no_active_entitlement",
+                message:
+                    "The device owner has no active trial or package (expired, used up, or never claimed). " +
+                    "Claim a trial or activate a package first."
+            }
+        };
+    }
+
+    const dup = await pool.query(
+        `SELECT id FROM gateway_peers
+         WHERE gateway_id = $1 AND device_id = $2
+           AND status IN ('pending', 'active')`,
+        [gatewayId, deviceId]
+    );
+    if (dup.rows.length > 0) {
+        return {
+            status: 409,
+            body: { message: "Device is already peered on this gateway" }
+        };
+    }
+
+    // unique_gateway_device blocks re-authorizing a device whose old
+    // peer row lingers in a terminal state — clear those first.
+    await pool.query(
+        `DELETE FROM gateway_peers
+         WHERE gateway_id = $1 AND device_id = $2
+           AND status IN ('revoked', 'error', 'inactive')`,
+        [gatewayId, deviceId]
+    );
+
+    // Allocation is SELECT-then-INSERT, so two concurrent callers can pick the
+    // same IP; the unique index on (gateway_id, tunnel_ip) rejects the loser
+    // with 23505 and we simply allocate again.
+    let peer = null;
+    let tunnel_ip = null;
+    for (let attempt = 0; attempt < MAX_IP_ATTEMPTS; attempt++) {
+        tunnel_ip = await allocateTunnelIp(gatewayId);
+        if (!tunnel_ip) {
+            return {
+                status: 507,
+                body: { message: "No free tunnel IPs left on this gateway" }
+            };
+        }
+        try {
+            peer = await pool.query(
+                `INSERT INTO gateway_peers
+                    (gateway_id, device_id, tunnel_ip, public_key, status)
+                 VALUES ($1, $2, $3, $4, 'pending')
+                 RETURNING *`,
+                [gatewayId, deviceId, tunnel_ip, dev.rows[0].public_key]
+            );
+            break;
+        } catch (err) {
+            if (err.code !== "23505") throw err;
+            if (err.constraint === "unique_gateway_device") {
+                return {
+                    status: 409,
+                    body: { message: "Device is already peered on this gateway" }
+                };
+            }
+            // tunnel_ip collision: retry with a fresh allocation
+        }
+    }
+    if (!peer) {
+        return {
+            status: 503,
+            body: { message: "Could not allocate a tunnel IP, please retry" }
+        };
+    }
+
+    const command = await enqueueCommand(gatewayId, "AUTHORIZE_PEER", {
+        peer_id: peer.rows[0].id,
+        device_id: deviceId,
+        public_key: dev.rows[0].public_key,
+        tunnel_ip,
+    });
+
+    return {
+        status: 201,
+        body: {
+            message: "Peer authorization queued — applies on next gateway heartbeat",
+            peer: peer.rows[0],
+            command_id: command.message_id,
+        }
+    };
+};
+
 // POST /gateways/:id/peers — authorize a device as a WireGuard peer.
 // Body: { device_id }
 // Creates the peer row (status 'pending'), queues AUTHORIZE_PEER; the peer
@@ -79,90 +197,22 @@ const authorizePeer = async (req, res) => {
     try {
         if (!(await requireOperator(req, res))) return;
 
-        const gatewayId = req.params.id;
+        const { device_id } = req.body ?? {};
+        // Keep the original check order: unknown gateway (404) before a
+        // missing device_id (400).
         const gw = await pool.query(
             `SELECT id FROM gateways WHERE id = $1`,
-            [gatewayId]
+            [req.params.id]
         );
         if (gw.rows.length === 0) {
             return res.status(404).json({ message: "Gateway not found" });
         }
-
-        const { device_id } = req.body ?? {};
         if (!device_id) {
             return res.status(400).json({ message: "device_id is required" });
         }
 
-        const dev = await pool.query(
-            `SELECT id, user_id, public_key FROM devices WHERE id = $1`,
-            [device_id]
-        );
-        if (dev.rows.length === 0) {
-            return res.status(404).json({ message: "Device not found" });
-        }
-
-        // Entitlement gate: a device may only be peered while its owner holds
-        // a live trial or subscription. Without this, an operator could hand
-        // free internet to any registered device. "Live" uses the same rules
-        // usage ingestion relies on (status 'active', quota not used up) plus
-        // the time window, so a lapsed trial or package is refused too.
-        if (!(await hasActiveEntitlement(dev.rows[0].user_id))) {
-            return res.status(403).json({
-                code: "no_active_entitlement",
-                message:
-                    "The device owner has no active trial or package (expired, used up, or never claimed). " +
-                    "Claim a trial or activate a package first."
-            });
-        }
-
-        const dup = await pool.query(
-            `SELECT id FROM gateway_peers
-             WHERE gateway_id = $1 AND device_id = $2
-               AND status IN ('pending', 'active')`,
-            [gatewayId, device_id]
-        );
-        if (dup.rows.length > 0) {
-            return res.status(409).json({
-                message: "Device is already peered on this gateway"
-            });
-        }
-
-        // unique_gateway_device blocks re-authorizing a device whose old
-        // peer row lingers in a terminal state — clear those first.
-        await pool.query(
-            `DELETE FROM gateway_peers
-             WHERE gateway_id = $1 AND device_id = $2
-               AND status IN ('revoked', 'error', 'inactive')`,
-            [gatewayId, device_id]
-        );
-
-        const tunnel_ip = await allocateTunnelIp(gatewayId);
-        if (!tunnel_ip) {
-            return res.status(507).json({
-                message: "No free tunnel IPs left on this gateway"
-            });
-        }
-
-        const peer = await pool.query(
-            `INSERT INTO gateway_peers
-                (gateway_id, device_id, tunnel_ip, public_key, status)
-             VALUES ($1, $2, $3, $4, 'pending')
-             RETURNING *`,
-            [gatewayId, device_id, tunnel_ip, dev.rows[0].public_key]
-        );
-
-        const command = await enqueueCommand(gatewayId, "AUTHORIZE_PEER", {
-            peer_id: peer.rows[0].id,
-            device_id,
-            public_key: dev.rows[0].public_key,
-            tunnel_ip,
-        });
-
-        return res.status(201).json({
-            message: "Peer authorization queued — applies on next gateway heartbeat",
-            peer: peer.rows[0],
-            command_id: command.message_id,
-        });
+        const { status, body } = await authorizeDevice(req.params.id, device_id);
+        return res.status(status).json(body);
     } catch (error) {
         console.error("authorizePeer error:", error);
         return res.status(500).json({ message: "Server error" });
@@ -210,4 +260,4 @@ const revokePeer = async (req, res) => {
     }
 };
 
-export { listPeers, authorizePeer, revokePeer, hasActiveEntitlement };
+export { listPeers, authorizePeer, authorizeDevice, revokePeer, hasActiveEntitlement };

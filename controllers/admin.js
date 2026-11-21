@@ -369,6 +369,89 @@ const getStats = async (req, res) => {
     }
 };
 
+// PATCH /admin/gateways/:id — set the WireGuard connection info customers
+// use to dial this gateway. Body: { wg_public_key?, wg_endpoint?, wg_dns? }
+// (a field set to null clears it)
+const WG_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
+const HOST_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+const validIpv4 = (s) => IPV4_RE.test(s) && s.split(".").every((o) => Number(o) <= 255);
+
+function validEndpoint(v) {
+    if (typeof v !== "string" || v.length > 255) return false;
+    const i = v.lastIndexOf(":");
+    if (i <= 0) return false;
+    const host = v.slice(0, i);
+    const portStr = v.slice(i + 1);
+    if (!/^\d{1,5}$/.test(portStr)) return false;
+    const port = Number(portStr);
+    if (port < 1 || port > 65535) return false;
+    if (IPV4_RE.test(host)) return validIpv4(host);
+    if (/^\[[0-9A-Fa-f:.]+\]$/.test(host)) return true; // [ipv6]:port
+    return HOST_RE.test(host);
+}
+
+function validDns(v) {
+    if (typeof v !== "string" || v.length > 255) return false;
+    return v.split(",").map((s) => s.trim()).every(
+        (p) => validIpv4(p) || (/^[0-9A-Fa-f:]+$/.test(p) && p.includes(":"))
+    );
+}
+
+const updateGatewayConnection = async (req, res) => {
+    try {
+        const body = req.body ?? {};
+        const rules = {
+            wg_public_key: [(v) => typeof v === "string" && WG_KEY_RE.test(v),
+                "wg_public_key must be a 44-char base64 WireGuard key ending with '='"],
+            wg_endpoint: [validEndpoint,
+                "wg_endpoint must be host:port with port 1-65535"],
+            wg_dns: [validDns,
+                "wg_dns must be a comma-separated list of IP addresses"],
+        };
+        const sets = [];
+        const vals = [];
+        const changed = [];
+        for (const [field, [ok, msg]] of Object.entries(rules)) {
+            if (!(field in body)) continue;
+            const v = body[field];
+            if (v !== null && !ok(v)) {
+                return res.status(400).json({ message: msg });
+            }
+            vals.push(v === null ? null : v.trim());
+            sets.push(`${field} = $${vals.length}`);
+            changed.push(field);
+        }
+        if (sets.length === 0) {
+            return res.status(400).json({
+                message: "Provide at least one of wg_public_key, wg_endpoint, wg_dns"
+            });
+        }
+
+        vals.push(req.params.id);
+        const result = await pool.query(
+            `UPDATE gateways SET ${sets.join(", ")} WHERE id = $${vals.length}
+             RETURNING *`,
+            vals
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: "Gateway not found" });
+        }
+
+        await auditLog({
+            actor: req.adminId,
+            action: "gateway.update_connection",
+            resource: `gateways:${req.params.id}`,
+            metadata: { fields: changed },
+        });
+
+        return res.status(200).json({ gateway: decorateGateway(result.rows[0]) });
+    } catch (error) {
+        console.error("admin updateGatewayConnection error:", error);
+        return res.status(500).json({ message: "Server error" });
+    }
+};
+
 export {
     listUsers,
     getUser,
@@ -376,6 +459,7 @@ export {
     updateUserRole,
     listGatewaysAdmin,
     deleteGateway,
+    updateGatewayConnection,
     updatePackage,
     deletePackage,
     listPayments,

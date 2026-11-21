@@ -1,5 +1,6 @@
 import { pool } from "../config/db.js";
 import { enqueueCommand } from "./gatewayCommands.js";
+import { authorizeDevice } from "./gatewayPeers.js";
 
 // WireGuard public keys are 32 bytes -> 44-char base64 ending with '='
 const WIREGUARD_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
@@ -154,4 +155,211 @@ const removeDevice = async (req, res) => {
     }
 };
 
-export { registerDevice, listDevices, removeDevice };
+
+// ---------- Self-service connect ----------
+
+const GATEWAY_ONLINE_WINDOW = "2 minutes";
+const DEFAULT_DNS = "8.8.8.8, 1.1.1.1";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Live entitlement with the latest expiry (same liveness rules as
+// hasActiveEntitlement), or null.
+async function getLiveEntitlement(userId) {
+    const r = await pool.query(
+        `SELECT kind, quota_bytes, used_bytes, expires_at FROM (
+            SELECT 'trial' AS kind, quota_bytes, used_bytes, expires_at
+              FROM trials
+             WHERE user_id = $1 AND status = 'active'
+               AND starts_at <= NOW() AND expires_at > NOW()
+               AND used_bytes < quota_bytes
+            UNION ALL
+            SELECT 'subscription', quota_bytes, used_bytes, expires_at
+              FROM subscriptions
+             WHERE user_id = $1 AND status = 'active'
+               AND starts_at <= NOW() AND expires_at > NOW()
+               AND used_bytes < quota_bytes
+         ) e ORDER BY expires_at DESC LIMIT 1`,
+        [userId]
+    );
+    const row = r.rows[0];
+    if (!row) return null;
+    return {
+        kind: row.kind,
+        quota_bytes: Number(row.quota_bytes),
+        used_bytes: Number(row.used_bytes),
+        expires_at: row.expires_at,
+    };
+}
+
+// Resolve the caller and their device. Sends the error response and returns
+// null when the caller is signed out or doesn't own the device (404 either
+// way, so ownership isn't leaked).
+async function loadOwnedDevice(req, res) {
+    if (!req.authUser) {
+        res.status(401).json({ message: "Unauthorized" });
+        return null;
+    }
+    const internalId = await getInternalUserId(req.authUser.id);
+    if (!internalId) {
+        res.status(404).json({ message: "Device not found" });
+        return null;
+    }
+    const dev = await pool.query(
+        `SELECT id, user_id, status FROM devices WHERE id = $1 AND user_id = $2`,
+        [req.params.id, internalId]
+    );
+    if (dev.rows.length === 0) {
+        res.status(404).json({ message: "Device not found" });
+        return null;
+    }
+    return dev.rows[0];
+}
+
+function buildConfig(gw, tunnelIp) {
+    return {
+        address: `${tunnelIp}/32`,
+        dns: (gw.wg_dns || DEFAULT_DNS)
+            .split(",").map((s) => s.trim()).filter(Boolean),
+        mtu: 1280,
+        peer: {
+            public_key: gw.wg_public_key,
+            endpoint: gw.wg_endpoint,
+            allowed_ips: ["0.0.0.0/0"],
+            persistent_keepalive: 25,
+        },
+    };
+}
+
+// POST /devices/:id/connect
+// Body: { gateway_id? }
+// The phone holds its own private key; we only ever see the public key it
+// registered via POST /devices. Returns everything needed to build the
+// WireGuard config (no private key anywhere).
+const connectDevice = async (req, res) => {
+    try {
+        const device = await loadOwnedDevice(req, res);
+        if (!device) return;
+
+        if (device.status !== "active") {
+            return res.status(409).json({
+                message: `Device is ${device.status}, not active`
+            });
+        }
+
+        const wanted = req.body?.gateway_id;
+        let gw;
+        if (wanted !== undefined && wanted !== null) {
+            if (typeof wanted !== "string" || !UUID_RE.test(wanted)) {
+                return res.status(404).json({ message: "Gateway not found" });
+            }
+            const r = await pool.query(
+                `SELECT id, name, wg_public_key, wg_endpoint, wg_dns
+                   FROM gateways WHERE id = $1`,
+                [wanted]
+            );
+            if (r.rows.length === 0) {
+                return res.status(404).json({ message: "Gateway not found" });
+            }
+            gw = r.rows[0];
+        } else {
+            const r = await pool.query(
+                `SELECT id, name, wg_public_key, wg_endpoint, wg_dns
+                   FROM gateways
+                  WHERE last_heartbeat_at > NOW() - INTERVAL '${GATEWAY_ONLINE_WINDOW}'
+                  ORDER BY name ASC`
+            );
+            if (r.rows.length === 0) {
+                return res.status(503).json({
+                    code: "no_gateway_online",
+                    message: "No gateway is online right now"
+                });
+            }
+            if (r.rows.length > 1) {
+                return res.status(409).json({
+                    code: "choose_gateway",
+                    message: "Several gateways are online; pass gateway_id",
+                    gateways: r.rows.map((g) => ({ id: g.id, name: g.name }))
+                });
+            }
+            gw = r.rows[0];
+        }
+
+        if (!gw.wg_public_key || !gw.wg_endpoint) {
+            return res.status(503).json({
+                code: "gateway_not_configured",
+                message: "This gateway has no WireGuard connection info yet"
+            });
+        }
+
+        const entitlement = await getLiveEntitlement(device.user_id);
+        if (!entitlement) {
+            return res.status(403).json({
+                code: "no_active_entitlement",
+                message:
+                    "No active trial or package (expired, used up, or never claimed). " +
+                    "Claim a trial or activate a package first."
+            });
+        }
+
+        // Idempotent: reuse a pending/active peer on this gateway.
+        const existing = await pool.query(
+            `SELECT id, status, tunnel_ip FROM gateway_peers
+              WHERE gateway_id = $1 AND device_id = $2
+                AND status IN ('pending', 'active')
+              LIMIT 1`,
+            [gw.id, device.id]
+        );
+        let peer = existing.rows[0];
+        let httpStatus = 200;
+
+        if (!peer) {
+            const result = await authorizeDevice(gw.id, device.id);
+            if (result.status !== 201) {
+                return res.status(result.status).json(result.body);
+            }
+            peer = result.body.peer;
+            httpStatus = 201;
+        }
+
+        return res.status(httpStatus).json({
+            status: peer.status,
+            peer_id: peer.id,
+            gateway: { id: gw.id, name: gw.name },
+            config: buildConfig(gw, peer.tunnel_ip),
+            entitlement,
+        });
+    } catch (error) {
+        console.error("connectDevice error:", error);
+        return res.status(500).json({ message: "Server error" });
+    }
+};
+
+// GET /devices/:id/connection — poll target for the app dashboard.
+const getConnection = async (req, res) => {
+    try {
+        const device = await loadOwnedDevice(req, res);
+        if (!device) return;
+
+        const peer = await pool.query(
+            `SELECT id, status, tunnel_ip, gateway_id FROM gateway_peers
+              WHERE device_id = $1
+              ORDER BY (status IN ('pending', 'active')) DESC
+              LIMIT 1`,
+            [device.id]
+        );
+        const p = peer.rows[0];
+
+        return res.status(200).json({
+            status: p?.status ?? "none",
+            peer_id: p?.id ?? null,
+            tunnel_ip: p?.tunnel_ip ?? null,
+            gateway_id: p?.gateway_id ?? null,
+            entitlement: await getLiveEntitlement(device.user_id),
+        });
+    } catch (error) {
+        console.error("getConnection error:", error);
+        return res.status(500).json({ message: "Server error" });
+    }
+};
+
+export { registerDevice, listDevices, removeDevice, connectDevice, getConnection };
