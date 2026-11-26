@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { pool } from "../config/db.js";
 import { deliverPendingCommands } from "./gatewayCommands.js";
 import { expireLapsedEntitlements } from "./entitlementExpiry.js";
+import { parseReachability } from "../utils/gatewaySelect.js";
 
 // Best-effort throttle for the expiry sweep. On serverless this is per
 // instance only; correctness never depends on it (the sweep is idempotent).
@@ -126,6 +127,29 @@ const heartbeat = async (req, res) => {
              WHERE id = $1`,
             [req.gateway.id]
         );
+
+        // Remote exit-node routing: record how customers can reach this
+        // gateway. Older gateways send no body and keep their admin-set
+        // endpoint. A malformed report never fails the heartbeat.
+        const reach = parseReachability(req.body);
+        if (reach) {
+            try {
+                await pool.query(
+                    `UPDATE gateways
+                        SET direct_endpoint = $2, relay_endpoint = $3,
+                            relay_connected = $4, reachability = $5,
+                            active_clients = $6, gateway_version = $7,
+                            wg_public_key = COALESCE($8, wg_public_key),
+                            reachability_reported_at = NOW()
+                      WHERE id = $1`,
+                    [req.gateway.id, reach.direct_endpoint, reach.relay_endpoint,
+                     reach.relay_connected, reach.reachability, reach.active_clients,
+                     reach.version, reach.wg_public_key]
+                );
+            } catch (reachError) {
+                console.error("heartbeat reachability error:", reachError);
+            }
+        }
 
         // Deliver any queued control-plane commands with this heartbeat
         const commands = await deliverPendingCommands(req.gateway.id);

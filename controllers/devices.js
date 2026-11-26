@@ -1,6 +1,7 @@
 import { pool } from "../config/db.js";
 import { enqueueCommand } from "./gatewayCommands.js";
 import { authorizeDevice } from "./gatewayPeers.js";
+import { pickGateway } from "../utils/gatewaySelect.js";
 
 // WireGuard public keys are 32 bytes -> 44-char base64 ending with '='
 const WIREGUARD_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
@@ -246,50 +247,52 @@ const connectDevice = async (req, res) => {
             });
         }
 
+        const GW_COLS = `g.id, g.name, g.wg_public_key, g.wg_endpoint, g.wg_dns,
+                g.direct_endpoint, g.relay_endpoint, g.relay_connected,
+                g.reachability, g.capacity_users,
+                (SELECT count(*)::int FROM gateway_peers p
+                  WHERE p.gateway_id = g.id AND p.status IN ('pending', 'active')) AS peer_count`;
+        const current = await pool.query(
+            `SELECT gateway_id FROM gateway_peers
+              WHERE device_id = $1 AND status IN ('pending', 'active')
+              LIMIT 1`,
+            [device.id]
+        );
+        const currentGatewayId = current.rows[0]?.gateway_id ?? null;
+
         const wanted = req.body?.gateway_id;
-        let gw;
+        let candidates;
         if (wanted !== undefined && wanted !== null) {
             if (typeof wanted !== "string" || !UUID_RE.test(wanted)) {
                 return res.status(404).json({ message: "Gateway not found" });
             }
             const r = await pool.query(
-                `SELECT id, name, wg_public_key, wg_endpoint, wg_dns
-                   FROM gateways WHERE id = $1`,
+                `SELECT ${GW_COLS} FROM gateways g WHERE g.id = $1`,
                 [wanted]
             );
             if (r.rows.length === 0) {
                 return res.status(404).json({ message: "Gateway not found" });
             }
-            gw = r.rows[0];
+            candidates = r.rows;
         } else {
             const r = await pool.query(
-                `SELECT id, name, wg_public_key, wg_endpoint, wg_dns
-                   FROM gateways
-                  WHERE last_heartbeat_at > NOW() - INTERVAL '${GATEWAY_ONLINE_WINDOW}'
-                  ORDER BY name ASC`
+                `SELECT ${GW_COLS} FROM gateways g
+                  WHERE g.last_heartbeat_at > NOW() - INTERVAL '${GATEWAY_ONLINE_WINDOW}'`
             );
-            if (r.rows.length === 0) {
-                return res.status(503).json({
-                    code: "no_gateway_online",
-                    message: "No gateway is online right now"
-                });
-            }
-            if (r.rows.length > 1) {
-                return res.status(409).json({
-                    code: "choose_gateway",
-                    message: "Several gateways are online; pass gateway_id",
-                    gateways: r.rows.map((g) => ({ id: g.id, name: g.name }))
-                });
-            }
-            gw = r.rows[0];
+            candidates = r.rows;
         }
 
-        if (!gw.wg_public_key || !gw.wg_endpoint) {
+        // Remote exit-node routing: an online gateway that is reachable from
+        // the internet (direct or through its relay) and has room. Never a
+        // "be near the gateway" fallback.
+        const choice = pickGateway(candidates, { currentGatewayId });
+        if (!choice) {
             return res.status(503).json({
-                code: "gateway_not_configured",
-                message: "This gateway has no WireGuard connection info yet"
+                code: "no_gateway_reachable",
+                message: "No CTD gateway can take a new connection right now. Please try again shortly."
             });
         }
+        const gw = { ...choice.gateway, wg_endpoint: choice.endpoint };
 
         const entitlement = await getLiveEntitlement(device.user_id);
         if (!entitlement) {
@@ -324,7 +327,7 @@ const connectDevice = async (req, res) => {
         return res.status(httpStatus).json({
             status: peer.status,
             peer_id: peer.id,
-            gateway: { id: gw.id, name: gw.name },
+            gateway: { id: gw.id, name: gw.name, path: choice.path },
             config: buildConfig(gw, peer.tunnel_ip),
             entitlement,
         });
