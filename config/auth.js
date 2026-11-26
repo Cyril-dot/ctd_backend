@@ -1,4 +1,5 @@
 import { betterAuth } from "better-auth";
+import { bearer } from "better-auth/plugins";
 import { kyselyAdapter } from "@better-auth/kysely-adapter";
 import { Kysely, PostgresDialect } from "kysely";
 import { pool } from "./db.js";
@@ -37,6 +38,11 @@ export const auth = betterAuth({
             },
         },
     },
+
+    // Mobile apps (CT Data) authenticate with a bearer token instead of
+    // cookies: sign-in returns it in the "set-auth-token" response header and
+    // the app sends "Authorization: Bearer <token>".
+    plugins: [bearer()],
 
     // Frontend origin(s) allowed to use the auth endpoints (cookies).
     trustedOrigins: process.env.FRONTEND_URL
