@@ -1,7 +1,7 @@
 import { pool } from "../config/db.js";
 import { enqueueCommand } from "./gatewayCommands.js";
 import { authorizeDevice } from "./gatewayPeers.js";
-import { pickGateway } from "../utils/gatewaySelect.js";
+import { pickGateway, clientIp } from "../utils/gatewaySelect.js";
 
 // WireGuard public keys are 32 bytes -> 44-char base64 ending with '='
 const WIREGUARD_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
@@ -216,7 +216,9 @@ async function loadOwnedDevice(req, res) {
     return dev.rows[0];
 }
 
-function buildConfig(gw, tunnelIp) {
+// endpoints: every way to reach the gateway, best first; the app tries
+// them in order until the tunnel answers.
+function buildConfig(gw, tunnelIp, endpoints = null) {
     return {
         address: `${tunnelIp}/32`,
         dns: (gw.wg_dns || DEFAULT_DNS)
@@ -225,6 +227,9 @@ function buildConfig(gw, tunnelIp) {
         peer: {
             public_key: gw.wg_public_key,
             endpoint: gw.wg_endpoint,
+            endpoints: (endpoints && endpoints.length)
+                ? endpoints.map((e) => ({ endpoint: e.endpoint, path: e.path }))
+                : [{ endpoint: gw.wg_endpoint, path: "configured" }],
             allowed_ips: ["0.0.0.0/0"],
             persistent_keepalive: 25,
         },
@@ -249,7 +254,8 @@ const connectDevice = async (req, res) => {
 
         const GW_COLS = `g.id, g.name, g.wg_public_key, g.wg_endpoint, g.wg_dns,
                 g.direct_endpoint, g.relay_endpoint, g.relay_connected,
-                g.reachability, g.capacity_users,
+                g.reachability, g.capacity_users, g.lan_endpoint,
+                g.public_ip, g.listen_port, g.port_forwarded,
                 (SELECT count(*)::int FROM gateway_peers p
                   WHERE p.gateway_id = g.id AND p.status IN ('pending', 'active')) AS peer_count`;
         const current = await pool.query(
@@ -285,7 +291,7 @@ const connectDevice = async (req, res) => {
         // Remote exit-node routing: an online gateway that is reachable from
         // the internet (direct or through its relay) and has room. Never a
         // "be near the gateway" fallback.
-        const choice = pickGateway(candidates, { currentGatewayId });
+        const choice = pickGateway(candidates, { currentGatewayId, clientIp: clientIp(req) });
         if (!choice) {
             return res.status(503).json({
                 code: "no_gateway_reachable",
@@ -328,7 +334,7 @@ const connectDevice = async (req, res) => {
             status: peer.status,
             peer_id: peer.id,
             gateway: { id: gw.id, name: gw.name, path: choice.path },
-            config: buildConfig(gw, peer.tunnel_ip),
+            config: buildConfig(gw, peer.tunnel_ip, choice.endpoints),
             entitlement,
         });
     } catch (error) {

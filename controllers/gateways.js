@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { pool } from "../config/db.js";
 import { deliverPendingCommands } from "./gatewayCommands.js";
 import { expireLapsedEntitlements } from "./entitlementExpiry.js";
-import { parseReachability } from "../utils/gatewaySelect.js";
+import { parseReachability, clientIp } from "../utils/gatewaySelect.js";
 
 // Best-effort throttle for the expiry sweep. On serverless this is per
 // instance only; correctness never depends on it (the sweep is idempotent).
@@ -140,11 +140,14 @@ const heartbeat = async (req, res) => {
                             relay_connected = $4, reachability = $5,
                             active_clients = $6, gateway_version = $7,
                             wg_public_key = COALESCE($8, wg_public_key),
+                            lan_endpoint = $9, listen_port = $10,
+                            port_forwarded = $11, public_ip = $12,
                             reachability_reported_at = NOW()
                       WHERE id = $1`,
                     [req.gateway.id, reach.direct_endpoint, reach.relay_endpoint,
                      reach.relay_connected, reach.reachability, reach.active_clients,
-                     reach.version, reach.wg_public_key]
+                     reach.version, reach.wg_public_key, reach.lan_endpoint,
+                     reach.listen_port, reach.port_forwarded, clientIp(req)]
                 );
             } catch (reachError) {
                 console.error("heartbeat reachability error:", reachError);

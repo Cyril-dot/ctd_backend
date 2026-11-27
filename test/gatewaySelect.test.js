@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pickGateway, parseReachability, effectiveEndpoint } from "../utils/gatewaySelect.js";
+import { pickGateway, parseReachability, effectiveEndpoint, endpointsFor, clientIp } from "../utils/gatewaySelect.js";
 
 const KEY = "A".repeat(43) + "=";
 const gw = (o) => ({ id: o.id, name: o.id, wg_public_key: KEY, capacity_users: 0, peer_count: 0, reachability: "unknown", relay_connected: false, ...o });
@@ -59,4 +59,32 @@ test("parseReachability sanitizes input", () => {
     assert.equal(r.reachability, "unreachable");
     assert.equal(r.active_clients, 0);
     assert.equal(parseReachability({}), null);
+});
+
+test("a phone on the gateway's own network gets the local address first", () => {
+    const g = gw({ id: "home", reachability: "lan", lan_endpoint: "10.112.214.226:51820", public_ip: "41.66.1.2" });
+    const r = pickGateway([g], { clientIp: "41.66.1.2" });
+    assert.equal(r.endpoint, "10.112.214.226:51820");
+    assert.equal(r.path, "lan");
+});
+
+test("a remote phone is never offered a local-only gateway", () => {
+    const g = gw({ id: "home", reachability: "lan", lan_endpoint: "10.112.214.226:51820", public_ip: "41.66.1.2" });
+    assert.equal(pickGateway([g], { clientIp: "154.160.0.9" }), null);
+});
+
+test("port forwarding publishes <public ip>:port automatically", () => {
+    const g = gw({ id: "home", reachability: "direct", port_forwarded: true, public_ip: "197.251.157.7", listen_port: 51820, lan_endpoint: "192.168.100.229:51820" });
+    assert.deepEqual(endpointsFor(g, { clientIp: "154.160.0.9" }).map((e) => e.endpoint), ["197.251.157.7:51820", "192.168.100.229:51820"]);
+    assert.deepEqual(endpointsFor(g, { clientIp: "197.251.157.7" }).map((e) => e.path), ["lan", "direct"]);
+});
+
+test("fallback order for a remote phone: direct, then relay", () => {
+    const g = gw({ id: "x", reachability: "direct", direct_endpoint: "197.251.157.7:51820", relay_connected: true, relay_endpoint: "203.0.113.9:51820" });
+    assert.deepEqual(endpointsFor(g).map((e) => e.path), ["direct", "relay"]);
+});
+
+test("clientIp reads the first forwarded address", () => {
+    assert.equal(clientIp({ headers: { "x-forwarded-for": "41.66.1.2, 76.76.21.21" } }), "41.66.1.2");
+    assert.equal(clientIp({ headers: { "x-real-ip": "41.66.1.3" } }), "41.66.1.3");
 });
