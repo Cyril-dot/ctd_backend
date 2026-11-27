@@ -12,6 +12,7 @@ import GatewaysRouter from "./routes/gateways.routes.js";
 import SessionsRouter from "./routes/sessions.routes.js";
 import UsageRouter from "./routes/usage.routes.js";
 import AdminRouter from "./routes/admin.routes.js";
+import NotificationsRouter from "./routes/notifications.routes.js";
 import { initRedis } from "./config/redis.js";
 import { rateLimit, perIp } from "./middleware/rateLimit.js";
 
@@ -65,6 +66,7 @@ app.use("/subscriptions", SubscriptionsRouter);
 app.use("/gateways", GatewaysRouter);
 app.use("/sessions", SessionsRouter);
 app.use("/usage", UsageRouter);
+app.use("/notifications", NotificationsRouter);
 app.use("/admin", AdminRouter);
 const result = await confirmation(pool);
 

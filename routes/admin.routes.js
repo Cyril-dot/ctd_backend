@@ -15,6 +15,7 @@ import {
     getStats,
 } from "../controllers/admin.js";
 import { uuidParam } from "../utils/uuid.js";
+import { createNotification, deleteNotification } from "../controllers/notifications.js";
 
 const AdminRouter = express.Router();
 AdminRouter.param("id", uuidParam("Resource"));
@@ -23,6 +24,9 @@ AdminRouter.param("id", uuidParam("Resource"));
 AdminRouter.use(requireAdmin);
 
 AdminRouter.get("/stats", getStats);
+
+AdminRouter.post("/notifications", createNotification);
+AdminRouter.delete("/notifications/:id", deleteNotification);
 
 AdminRouter.get("/users", listUsers);
 AdminRouter.get("/users/:id", getUser);
